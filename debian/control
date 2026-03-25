@@ -1,0 +1,13 @@
+Source: oxyos-upgrade
+Section: admin
+Priority: optional
+Maintainer: OxyHQ <hello@oxy.so>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 3.9.5
+Homepage: https://os.oxy.so
+
+Package: oxyos-upgrade
+Architecture: all
+Depends: ${misc:Depends}, apt, curl, jq
+Description: OxyOS system upgrade tool
+ CLI tool for upgrading OxyOS packages and performing major version upgrades.

@@ -1,0 +1,379 @@
+#!/bin/bash
+set -euo pipefail
+
+readonly VERSION="1.0"
+readonly CONF_FILE="/etc/oxyos/oxyos.conf"
+readonly RELEASES_URL="https://oxyos.ams3.digitaloceanspaces.com/packages/releases.json"
+readonly BACKUP_DIR="/var/backups/oxyos-upgrade"
+readonly LOG_FILE="/var/log/oxyos-upgrade.log"
+
+AUTO_YES=false
+
+# --- Helpers ---
+
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    echo "$msg"
+    echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+error() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error "This command must be run as root. Use: sudo oxyos-upgrade $1"
+    fi
+}
+
+load_conf() {
+    if [[ ! -f "$CONF_FILE" ]]; then
+        error "$CONF_FILE not found. Is this an OxyOS system?"
+    fi
+    # shellcheck source=/dev/null
+    . "$CONF_FILE"
+    if [[ -z "${OS_VERSION:-}" ]] || [[ -z "${OS_VERSION_CODENAME:-}" ]]; then
+        error "$CONF_FILE is missing OS_VERSION or OS_VERSION_CODENAME."
+    fi
+}
+
+fetch_releases() {
+    local releases
+    releases=$(curl -sfL --connect-timeout 10 --max-time 30 "$RELEASES_URL") || \
+        error "Failed to fetch release info from $RELEASES_URL. Check your network connection."
+    echo "$releases"
+}
+
+confirm() {
+    if [[ "$AUTO_YES" == true ]]; then
+        return 0
+    fi
+    local prompt="${1:-Continue?}"
+    echo -n "$prompt [y/N] "
+    read -r answer
+    case "$answer" in
+        [yY]|[yY][eE][sS]) return 0 ;;
+        *) echo "Aborted."; exit 0 ;;
+    esac
+}
+
+check_disk_space() {
+    local required_mb=$1
+    local avail_kb
+    avail_kb=$(df --output=avail / | tail -1 | tr -d ' ')
+    local avail_mb=$((avail_kb / 1024))
+    if [[ $avail_mb -lt $required_mb ]]; then
+        error "Insufficient disk space. Need ${required_mb}MB, have ${avail_mb}MB free."
+    fi
+}
+
+check_dpkg_lock() {
+    if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+        error "Another package manager is running. Wait for it to finish and try again."
+    fi
+}
+
+check_network() {
+    if ! curl -sfL --connect-timeout 5 --max-time 10 --head "$RELEASES_URL" >/dev/null 2>&1; then
+        error "Cannot reach $RELEASES_URL. Check your network connection."
+    fi
+}
+
+check_battery() {
+    local status_file="/sys/class/power_supply/BAT0/status"
+    if [[ -f "$status_file" ]]; then
+        local status
+        status=$(cat "$status_file")
+        if [[ "$status" == "Discharging" ]]; then
+            echo "Warning: System is running on battery power."
+            confirm "Major upgrades should be done on AC power. Continue anyway?"
+        fi
+    fi
+}
+
+usage() {
+    cat <<EOF
+oxyos-upgrade $VERSION — OxyOS system upgrade tool
+
+Usage: oxyos-upgrade <command> [options]
+
+Commands:
+  check     Check for available updates and new releases
+  update    Update all packages within the current OxyOS version
+  upgrade   Upgrade to a new OxyOS version
+
+Options:
+  -y, --yes       Skip confirmation prompts
+  -h, --help      Show this help message
+  -v, --version   Show version
+
+Examples:
+  oxyos-upgrade check
+  sudo oxyos-upgrade update
+  sudo oxyos-upgrade upgrade --yes
+EOF
+}
+
+# --- Commands ---
+
+cmd_check() {
+    load_conf
+
+    echo "Current: OxyOS ${OS_VERSION} (${OS_VERSION_CODENAME})"
+    echo ""
+
+    local releases
+    releases=$(fetch_releases)
+    local latest_version latest_codename
+    latest_version=$(echo "$releases" | jq -r '.latest.version')
+    latest_codename=$(echo "$releases" | jq -r '.latest.codename')
+
+    if [[ "$OS_VERSION_CODENAME" != "$latest_codename" ]]; then
+        echo "New release available: OxyOS ${latest_version} (${latest_codename})"
+        echo "Run 'sudo oxyos-upgrade upgrade' to upgrade."
+        echo ""
+    else
+        echo "OxyOS is on the latest release."
+        echo ""
+    fi
+
+    echo "Checking for package updates..."
+    if [[ $EUID -eq 0 ]]; then
+        apt-get update -qq 2>/dev/null
+    else
+        echo "(Run as root to refresh package lists)"
+    fi
+
+    local upgradable
+    upgradable=$(apt list --upgradable 2>/dev/null | grep -v "^Listing" || true)
+    if [[ -n "$upgradable" ]]; then
+        echo "Upgradable packages:"
+        echo "$upgradable"
+        echo ""
+        echo "Run 'sudo oxyos-upgrade update' to install updates."
+        [[ "$OS_VERSION_CODENAME" != "$latest_codename" ]] && exit 1
+        exit 1
+    else
+        echo "All packages are up to date."
+    fi
+
+    [[ "$OS_VERSION_CODENAME" != "$latest_codename" ]] && exit 1
+    exit 0
+}
+
+cmd_update() {
+    require_root "update"
+    load_conf
+
+    log "Starting package update for OxyOS ${OS_VERSION} (${OS_VERSION_CODENAME})"
+
+    # Pre-flight checks
+    check_dpkg_lock
+    check_network
+    check_disk_space 500
+
+    log "Refreshing package lists..."
+    apt-get update
+
+    echo ""
+    echo "Simulating upgrade..."
+    apt-get dist-upgrade --simulate
+
+    echo ""
+    confirm "Apply these updates?"
+
+    log "Installing updates..."
+    apt-get dist-upgrade -y
+
+    log "Update complete."
+}
+
+cmd_upgrade() {
+    require_root "upgrade"
+    load_conf
+
+    local releases
+    releases=$(fetch_releases)
+    local latest_version latest_codename latest_debian_base
+    latest_version=$(echo "$releases" | jq -r '.latest.version')
+    latest_codename=$(echo "$releases" | jq -r '.latest.codename')
+    latest_debian_base=$(echo "$releases" | jq -r '.latest.debian_base')
+
+    if [[ "$OS_VERSION_CODENAME" == "$latest_codename" ]]; then
+        echo "Already on the latest version: OxyOS ${OS_VERSION} (${OS_VERSION_CODENAME})"
+        echo "Use 'sudo oxyos-upgrade update' to check for package updates."
+        exit 0
+    fi
+
+    echo "=== OxyOS Major Version Upgrade ==="
+    echo ""
+    echo "  Current: OxyOS ${OS_VERSION} (${OS_VERSION_CODENAME})"
+    echo "  Target:  OxyOS ${latest_version} (${latest_codename})"
+    echo ""
+
+    # Pre-flight checks
+    check_dpkg_lock
+    check_network
+    check_disk_space 1024
+    check_battery
+
+    # Backup phase
+    local timestamp backup_path
+    timestamp=$(date '+%Y-%m-%d_%H%M%S')
+    backup_path="${BACKUP_DIR}/${timestamp}"
+    mkdir -p "$backup_path"
+
+    log "Backing up configuration to ${backup_path}/"
+    cp "$CONF_FILE" "$backup_path/"
+    cp /etc/os-release "$backup_path/"
+    if [[ -d /etc/apt/sources.list.d ]]; then
+        cp -r /etc/apt/sources.list.d "$backup_path/"
+    fi
+    if [[ -f /etc/apt/sources.list ]]; then
+        cp /etc/apt/sources.list "$backup_path/"
+    fi
+
+    echo "Configuration backed up to: ${backup_path}/"
+    echo ""
+
+    confirm "Proceed with upgrade to OxyOS ${latest_version} (${latest_codename})?"
+
+    # Update APT sources — replace old codename with new
+    local old_codename="$OS_VERSION_CODENAME"
+    local new_codename="$latest_codename"
+
+    log "Updating APT sources: ${old_codename} -> ${new_codename}"
+
+    # Handle .list files
+    local list_file
+    for list_file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list; do
+        if [[ -f "$list_file" ]]; then
+            if grep -q "$old_codename" "$list_file"; then
+                sed -i "s|${old_codename}|${new_codename}|g" "$list_file"
+                log "Updated: ${list_file}"
+            fi
+        fi
+    done
+
+    # Handle DEB822 .sources files
+    local sources_file
+    for sources_file in /etc/apt/sources.list.d/*.sources; do
+        if [[ -f "$sources_file" ]]; then
+            if grep -q "$old_codename" "$sources_file"; then
+                sed -i "s|${old_codename}|${new_codename}|g" "$sources_file"
+                log "Updated: ${sources_file}"
+            fi
+        fi
+    done
+
+    # Update Debian base if it changed
+    local old_debian_base="${OS_ID_LIKE:-debian}"
+    if [[ -n "$latest_debian_base" ]] && [[ "$latest_debian_base" != "null" ]]; then
+        for sources_file in /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list /etc/apt/sources.list; do
+            if [[ -f "$sources_file" ]]; then
+                # Only replace debian suite names in security/updates lines, not OxyOS repo lines
+                if grep -q "debian.org\|security.debian.org" "$sources_file"; then
+                    local current_debian
+                    current_debian=$(grep -oP '(?:trixie|bookworm|bullseye|buster)' "$sources_file" | head -1 || true)
+                    if [[ -n "$current_debian" ]] && [[ "$current_debian" != "$latest_debian_base" ]]; then
+                        sed -i "s|${current_debian}|${latest_debian_base}|g" "$sources_file"
+                        log "Updated Debian base in: ${sources_file} (${current_debian} -> ${latest_debian_base})"
+                    fi
+                fi
+            fi
+        done
+    fi
+
+    log "Refreshing package lists..."
+    if ! apt-get update; then
+        echo ""
+        echo "apt-get update failed. Your original config files are backed up at:"
+        echo "  ${backup_path}/"
+        echo ""
+        echo "To restore: sudo cp -r ${backup_path}/sources.list.d/* /etc/apt/sources.list.d/"
+        echo "Then run:   sudo apt-get update"
+        exit 1
+    fi
+
+    log "Upgrading packages..."
+    if ! apt-get dist-upgrade -y; then
+        echo ""
+        echo "Package upgrade failed. Your original config files are backed up at:"
+        echo "  ${backup_path}/"
+        echo ""
+        echo "To attempt recovery:"
+        echo "  sudo apt-get -f install"
+        echo "  sudo dpkg --configure -a"
+        exit 1
+    fi
+
+    # Update oxyos.conf
+    log "Updating ${CONF_FILE}..."
+    sed -i "s|^OS_VERSION=.*|OS_VERSION=\"${latest_version}\"|" "$CONF_FILE"
+    sed -i "s|^OS_VERSION_CODENAME=.*|OS_VERSION_CODENAME=\"${latest_codename}\"|" "$CONF_FILE"
+
+    # Update os-release
+    if [[ -f /etc/os-release ]]; then
+        sed -i "s|^VERSION_ID=.*|VERSION_ID=\"${latest_version}\"|" /etc/os-release
+        sed -i "s|^VERSION=.*|VERSION=\"${latest_version} (${latest_codename})\"|" /etc/os-release
+        sed -i "s|^VERSION_CODENAME=.*|VERSION_CODENAME=${latest_codename}|" /etc/os-release
+        sed -i "s|^PRETTY_NAME=.*|PRETTY_NAME=\"OxyOS ${latest_version} (${latest_codename})\"|" /etc/os-release
+    fi
+
+    # Update lsb-release
+    if [[ -f /etc/lsb-release ]]; then
+        sed -i "s|^DISTRIB_RELEASE=.*|DISTRIB_RELEASE=${latest_version}|" /etc/lsb-release
+        sed -i "s|^DISTRIB_CODENAME=.*|DISTRIB_CODENAME=${latest_codename}|" /etc/lsb-release
+        sed -i "s|^DISTRIB_DESCRIPTION=.*|DISTRIB_DESCRIPTION=\"OxyOS ${latest_version} (${latest_codename})\"|" /etc/lsb-release
+    fi
+
+    echo ""
+    log "=== Upgrade complete! ==="
+    echo ""
+    echo "  OxyOS ${OS_VERSION} (${OS_VERSION_CODENAME}) -> ${latest_version} (${latest_codename})"
+    echo ""
+    echo "  Please reboot your system: sudo reboot"
+    echo ""
+}
+
+# --- Main ---
+
+COMMAND=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        check|update|upgrade)
+            COMMAND="$1"
+            shift
+            ;;
+        -y|--yes)
+            AUTO_YES=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -v|--version)
+            echo "oxyos-upgrade $VERSION"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "$COMMAND" ]]; then
+    usage
+    exit 1
+fi
+
+case "$COMMAND" in
+    check)   cmd_check ;;
+    update)  cmd_update ;;
+    upgrade) cmd_upgrade ;;
+esac
