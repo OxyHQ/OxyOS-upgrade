@@ -3,7 +3,7 @@ set -euo pipefail
 
 readonly VERSION="1.0"
 readonly CONF_FILE="/etc/oxyos/oxyos.conf"
-readonly RELEASES_URL="https://os.oxy.so/packages/releases.json"
+readonly RELEASES_URL="https://oxy.so/os/releases.json"
 readonly BACKUP_DIR="/var/backups/oxyos-upgrade"
 readonly LOG_FILE="/var/log/oxyos-upgrade.log"
 
